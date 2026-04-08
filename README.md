@@ -1,3 +1,11 @@
+---
+title: metaOpenEnvHack
+emoji: 🌍
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 8000
+---
 # TravelOps — Business-Travel Execution & Disruption Recovery
 
 > An OpenEnv benchmark where an AI agent must search, book, and recover multi-modal itineraries across India's intercity network under budget, policy, and time constraints.
