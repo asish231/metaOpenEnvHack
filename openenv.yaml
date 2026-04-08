@@ -1,0 +1,12 @@
+spec_version: 1
+name: travel_ops_env
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+description: >
+  Business-travel execution and disruption-recovery benchmark.
+  An AI agent must search, book, and recover multi-modal itineraries
+  across an India intercity network under time and budget constraints.
+action_model: models.TravelAction
+observation_model: models.TravelObservation
