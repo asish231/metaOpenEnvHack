@@ -24,3 +24,6 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["server*", "models*", "client*"]
+
+[project.scripts]
+server = "server.app:main"
