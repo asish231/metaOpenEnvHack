@@ -139,6 +139,27 @@ def _parse_llm_action(raw: str) -> TravelAction:
     return TravelAction(**data)
 
 
+def _extract_route(task_brief: str) -> list[str]:
+    """Extract ordered city list from a task brief string."""
+    import re
+    # Try "→" route pattern first: e.g. "Hyderabad → Delhi → Chandigarh"
+    if "→" in task_brief:
+        # Get the part containing arrows (before first period after the arrow chain)
+        arrow_part = task_brief.split(".")[0] if "." in task_brief else task_brief
+        # If there's a colon before arrows, take after it
+        if ":" in arrow_part and arrow_part.index(":") < arrow_part.index("→"):
+            arrow_part = arrow_part.split(":", 1)[1]
+        cities = [c.strip() for c in arrow_part.split("→")]
+        cities = [c for c in cities if c]
+        if len(cities) >= 2:
+            return cities
+    # Try "from X to Y" pattern
+    m = re.search(r"from\s+(\w[\w\s]*?)\s+to\s+(\w[\w\s]*?)[\s.,]", task_brief, re.IGNORECASE)
+    if m:
+        return [m.group(1).strip(), m.group(2).strip()]
+    return []
+
+
 def _safe_fallback_action(obs_dict: dict, scenario_id: str = "") -> TravelAction:
     """Smart deterministic fallback when LLM output is unparseable."""
     bookings = obs_dict.get("active_bookings", [])
@@ -147,45 +168,36 @@ def _safe_fallback_action(obs_dict: dict, scenario_id: str = "") -> TravelAction
     task_brief = obs_dict.get("task_brief", "")
     disruption = obs_dict.get("active_disruption")
 
-    # extract final destination from the task brief
-    final_dest = ""
-    if "→" in task_brief:
-        # "Hyderabad → Delhi → Chandigarh" or "Bangalore → Mumbai"
-        parts = [p.strip().rstrip(".") for p in task_brief.split("→")]
-        final_dest = parts[-1].split(".")[0].split(",")[0].strip()
+    route = _extract_route(task_brief)
+    final_dest = route[-1] if route else ""
 
     # confirmed bookings only
     confirmed = [b for b in bookings if b.get("status") == "confirmed"]
-    cancelled = [b for b in bookings if b.get("status") in ("cancelled", "disrupted")]
 
-    # 1) If there's a disruption and we have cancelled/disrupted bookings, cancel them first
-    if disruption or cancelled:
-        for b in bookings:
-            if b.get("status") == "disrupted":
-                return TravelAction(action_type=ActionType.CANCEL_BOOKING, booking_id=b["booking_id"])
+    # 1) If there are disrupted bookings, cancel them to free budget
+    for b in bookings:
+        if b.get("status") == "disrupted":
+            return TravelAction(action_type=ActionType.CANCEL_BOOKING, booking_id=b["booking_id"])
 
     # 2) If at final destination → finalize
-    if current_city == final_dest:
+    if current_city and current_city == final_dest:
         return TravelAction(action_type=ActionType.FINALIZE_TRIP)
 
-    # 3) Figure out what city we need to reach next
-    # For multi-leg: parse intermediate cities from task_brief
+    # 3) Figure out what city we need to reach next along the route
     next_dest = final_dest
-    if "→" in task_brief:
-        parts = [p.strip().rstrip(".") for p in task_brief.split("→")]
-        # find current city in chain and get next
-        for i, p in enumerate(parts):
-            city = p.split(".")[0].split(",")[0].strip()
-            if city == current_city and i + 1 < len(parts):
-                next_dest = parts[i + 1].split(".")[0].split(",")[0].strip()
-                break
+    for i, city in enumerate(route):
+        if city == current_city and i + 1 < len(route):
+            next_dest = route[i + 1]
+            break
+
+    if not next_dest:
+        return TravelAction(action_type=ActionType.WAIT, wait_minutes=60)
 
     # 4) If no search results for current leg, search
-    has_results_for_leg = False
-    for r in search_results:
-        if r.get("origin") == current_city and r.get("destination") == next_dest:
-            has_results_for_leg = True
-            break
+    has_results_for_leg = any(
+        r.get("origin") == current_city and r.get("destination") == next_dest
+        for r in search_results
+    )
 
     if not has_results_for_leg:
         return TravelAction(
@@ -195,27 +207,24 @@ def _safe_fallback_action(obs_dict: dict, scenario_id: str = "") -> TravelAction
         )
 
     # 5) If we have results but no confirmed booking for this leg, book the best flight
-    has_booking_for_leg = False
-    for b in confirmed:
-        opt = b.get("option", {})
-        if opt.get("origin") == current_city and opt.get("destination") == next_dest:
-            has_booking_for_leg = True
-            break
+    has_booking_for_leg = any(
+        b.get("option", {}).get("origin") == current_city
+        and b.get("option", {}).get("destination") == next_dest
+        for b in confirmed
+    )
 
     if not has_booking_for_leg and search_results:
-        # prefer flights by preferred carriers, then cheapest
-        best = None
-        for r in search_results:
-            if r.get("origin") != current_city or r.get("destination") != next_dest:
-                continue
-            if best is None:
-                best = r
-            elif r.get("mode") == "flight" and best.get("mode") != "flight":
-                best = r
-            elif r.get("mode") == best.get("mode") and r.get("price", 999999) < best.get("price", 999999):
-                best = r
-        if best:
-            return TravelAction(action_type=ActionType.BOOK_OPTION, option_id=best["option_id"])
+        current_time = obs_dict.get("current_time", "00:00")
+        # filter: departure must be in the future, then prefer flights, then cheapest
+        candidates = [
+            r for r in search_results
+            if r.get("origin") == current_city and r.get("destination") == next_dest
+            and r.get("departure_time", "00:00") >= current_time
+        ]
+        if candidates:
+            # sort: flights first, then by price
+            candidates.sort(key=lambda r: (0 if r.get("mode") == "flight" else 1, r.get("price", 999999)))
+            return TravelAction(action_type=ActionType.BOOK_OPTION, option_id=candidates[0]["option_id"])
 
     # 6) We have a booking — wait to advance time (larger increments)
     return TravelAction(action_type=ActionType.WAIT, wait_minutes=120)

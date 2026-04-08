@@ -488,7 +488,7 @@ class TravelOpsEnvironment(Environment):
         bid = action.booking_id
         found = None
         for bk in self._bookings:
-            if bk.booking_id == bid and bk.status == "confirmed":
+            if bk.booking_id == bid and bk.status in ("confirmed", "disrupted"):
                 found = bk
                 break
         if found is None:

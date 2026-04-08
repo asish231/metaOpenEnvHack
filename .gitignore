@@ -3,3 +3,7 @@ tutorialofopenenv.txt
 .DS_Store
 .env
 PLAN.md
+.venv/
+__pycache__/
+*.egg-info/
+outputs/
