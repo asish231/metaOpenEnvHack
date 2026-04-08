@@ -5,9 +5,9 @@ Runs all 3 benchmark tasks using an LLM via the OpenAI client.
 Emits structured [START], [STEP], [END] logs per hackathon spec.
 
 Environment variables:
-    API_BASE_URL  — LLM API endpoint
-    MODEL_NAME    — model identifier
-    ZAI_API_KEY   — Z.ai API key (fallback: OPENAI_API_KEY or HF_TOKEN)
+    OPENROUTER_BASE_URL   — OpenRouter API endpoint
+    OPENROUTER_MODEL_NAME — model identifier
+    OPENROUTER_API_KEY    — OpenRouter API key
 """
 
 from __future__ import annotations
@@ -32,24 +32,24 @@ from server.travel_ops_environment import TravelOpsEnvironment, SCENARIO_IDS
 from dotenv import load_dotenv
 load_dotenv()  # Load variables from .env
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://open.bigmodel.cn/api/paas/v4/")
-MODEL_NAME = os.environ.get("MODEL_NAME", "GLM-4.7-Flash")
-API_KEY = (
-    os.environ.get("ZAI_API_KEY")
-    or os.environ.get("OPENAI_API_KEY")
-    or os.environ.get("HF_TOKEN", "")
-)
+API_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+MODEL_NAME = os.environ.get("OPENROUTER_MODEL_NAME", "openai/gpt-oss-120b:free")
+API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 try:
-    from zai import ZaiClient
-    client = ZaiClient(api_key=API_KEY)
+    from openai import OpenAI
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     LLM_AVAILABLE = True
 except Exception as e:
     LLM_AVAILABLE = False
     client = None
-    print(f"Error loading ZaiClient: {e}", file=sys.stderr)
+    print(f"Error loading OpenAI client: {e}", file=sys.stderr)
 
 MAX_STEPS = 12
+LLM_MIN_INTERVAL_SEC = float(os.environ.get("LLM_MIN_INTERVAL_SEC", "2.5"))
+LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
+LLM_RETRY_BASE_DELAY_SEC = float(os.environ.get("LLM_RETRY_BASE_DELAY_SEC", "2.0"))
+_last_llm_call_ts = 0.0
 
 # ── system prompt ───────────────────────────────────────────────────────────
 
@@ -237,6 +237,50 @@ def _safe_fallback_action(obs_dict: dict, scenario_id: str = "") -> TravelAction
     return TravelAction(action_type=ActionType.WAIT, wait_minutes=120)
 
 
+def _request_llm_action(obs_dict: dict, step: int) -> TravelAction:
+    """Call LLM with pacing and retry logic to reduce provider rate-limit failures."""
+    global _last_llm_call_ts
+
+    user_msg = _build_user_message(obs_dict, step)
+    last_error: Exception | None = None
+
+    for attempt in range(LLM_MAX_RETRIES):
+        elapsed = time.time() - _last_llm_call_ts
+        if elapsed < LLM_MIN_INTERVAL_SEC:
+            time.sleep(LLM_MIN_INTERVAL_SEC - elapsed)
+
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.0,
+                max_tokens=300,
+            )
+            _last_llm_call_ts = time.time()
+            llm_raw = resp.choices[0].message.content or ""
+            return _parse_llm_action(llm_raw)
+        except Exception as e:
+            _last_llm_call_ts = time.time()
+            last_error = e
+            err_text = str(e)
+            is_rate_limited = "429" in err_text or "Rate limit" in err_text
+            if not is_rate_limited or attempt == LLM_MAX_RETRIES - 1:
+                raise
+
+            delay = LLM_RETRY_BASE_DELAY_SEC * (2 ** attempt)
+            print(
+                f"  [WARN] LLM rate-limited (attempt {attempt + 1}/{LLM_MAX_RETRIES}); "
+                f"retrying in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(f"LLM request failed after retries: {last_error}")
+
+
 # ── main loop ───────────────────────────────────────────────────────────────
 
 def run_task(env: TravelOpsEnvironment, scenario_id: str, task_idx: int) -> dict:
@@ -253,21 +297,9 @@ def run_task(env: TravelOpsEnvironment, scenario_id: str, task_idx: int) -> dict
 
         # get LLM action
         action = None
-        llm_raw = ""
         try:
             if LLM_AVAILABLE and client is not None:
-                user_msg = _build_user_message(obs_dict, step)
-                resp = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    temperature=0.0,
-                    max_tokens=300,
-                )
-                llm_raw = resp.choices[0].message.content or ""
-                action = _parse_llm_action(llm_raw)
+                action = _request_llm_action(obs_dict, step)
             else:
                 action = _safe_fallback_action(obs_dict)
         except Exception as e:

@@ -7,7 +7,7 @@ Emits structured [START], [STEP], [END] logs per hackathon spec.
 Environment variables:
     API_BASE_URL  — LLM API endpoint
     MODEL_NAME    — model identifier
-    HF_TOKEN      — Hugging Face / API key (fallback: OPENAI_API_KEY)
+    HF_TOKEN      — Hugging Face / API key
 """
 
 from __future__ import annotations
@@ -29,10 +29,12 @@ from models import (
 from server.travel_ops_environment import TravelOpsEnvironment, SCENARIO_IDS
 
 # ── LLM client setup ───────────────────────────────────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-API_KEY = os.environ.get("HF_TOKEN") or os.environ.get("OPENAI_API_KEY", "")
+API_BASE_URL = os.environ.get("API_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+MODEL_NAME = os.environ.get("MODEL_NAME") or os.environ.get("OPENROUTER_MODEL_NAME", "openai/gpt-oss-120b:free")
+API_KEY = os.environ.get("HF_TOKEN") or os.environ.get("OPENROUTER_API_KEY", "")
 
 try:
     from openai import OpenAI
@@ -42,7 +44,11 @@ except Exception:
     LLM_AVAILABLE = False
     client = None
 
-MAX_STEPS = 12
+MAX_STEPS = 8
+LLM_MIN_INTERVAL_SEC = float(os.environ.get("LLM_MIN_INTERVAL_SEC", "2.5"))
+LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
+LLM_RETRY_BASE_DELAY_SEC = float(os.environ.get("LLM_RETRY_BASE_DELAY_SEC", "2.0"))
+_last_llm_call_ts = 0.0
 
 # ── system prompt ───────────────────────────────────────────────────────────
 
@@ -76,6 +82,11 @@ You are a business-travel operations agent. You interact with a travel environme
 ### Output format — ONLY valid JSON, nothing else:
 {"action_type": "...", ...fields...}
 """
+
+
+def _log_event(event: str, **payload: object) -> None:
+    record = {"event": event, **payload}
+    print(json.dumps(record, ensure_ascii=True), flush=True)
 
 
 def _build_user_message(obs_dict: dict, step: int) -> str:
@@ -230,6 +241,50 @@ def _safe_fallback_action(obs_dict: dict, scenario_id: str = "") -> TravelAction
     return TravelAction(action_type=ActionType.WAIT, wait_minutes=120)
 
 
+def _request_llm_action(obs_dict: dict, step: int) -> TravelAction:
+    """Call LLM with pacing and retry logic to reduce provider rate-limit failures."""
+    global _last_llm_call_ts
+
+    user_msg = _build_user_message(obs_dict, step)
+    last_error: Exception | None = None
+
+    for attempt in range(LLM_MAX_RETRIES):
+        elapsed = time.time() - _last_llm_call_ts
+        if elapsed < LLM_MIN_INTERVAL_SEC:
+            time.sleep(LLM_MIN_INTERVAL_SEC - elapsed)
+
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.0,
+                max_tokens=300,
+            )
+            _last_llm_call_ts = time.time()
+            llm_raw = resp.choices[0].message.content or ""
+            return _parse_llm_action(llm_raw)
+        except Exception as e:
+            _last_llm_call_ts = time.time()
+            last_error = e
+            err_text = str(e)
+            is_rate_limited = "429" in err_text or "Rate limit" in err_text
+            if not is_rate_limited or attempt == LLM_MAX_RETRIES - 1:
+                raise
+
+            delay = LLM_RETRY_BASE_DELAY_SEC * (2 ** attempt)
+            print(
+                f"  [WARN] LLM rate-limited (attempt {attempt + 1}/{LLM_MAX_RETRIES}); "
+                f"retrying in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(f"LLM request failed after retries: {last_error}")
+
+
 # ── main loop ───────────────────────────────────────────────────────────────
 
 def run_task(env: TravelOpsEnvironment, scenario_id: str, task_idx: int) -> dict:
@@ -237,7 +292,7 @@ def run_task(env: TravelOpsEnvironment, scenario_id: str, task_idx: int) -> dict
     obs = env.reset(scenario_id=scenario_id)
     obs_dict = obs.model_dump()
 
-    print(f"[START] task_id={scenario_id} task_index={task_idx}")
+    _log_event("START", task_id=scenario_id, task_index=task_idx)
 
     total_reward = 0.0
     for step in range(1, MAX_STEPS + 1):
@@ -246,21 +301,9 @@ def run_task(env: TravelOpsEnvironment, scenario_id: str, task_idx: int) -> dict
 
         # get LLM action
         action = None
-        llm_raw = ""
         try:
             if LLM_AVAILABLE and client is not None:
-                user_msg = _build_user_message(obs_dict, step)
-                resp = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    temperature=0.0,
-                    max_tokens=300,
-                )
-                llm_raw = resp.choices[0].message.content or ""
-                action = _parse_llm_action(llm_raw)
+                action = _request_llm_action(obs_dict, step)
             else:
                 action = _safe_fallback_action(obs_dict)
         except Exception as e:
@@ -273,12 +316,14 @@ def run_task(env: TravelOpsEnvironment, scenario_id: str, task_idx: int) -> dict
         reward = obs_dict.get("reward", 0.0) or 0.0
         total_reward += reward
 
-        print(
-            f"[STEP] task_id={scenario_id} step={step} "
-            f"action={action.action_type.value} "
-            f"reward={reward:.4f} "
-            f"done={obs_dict.get('done', False)} "
-            f"info={obs_dict.get('metadata', {}).get('info', '')}"
+        _log_event(
+            "STEP",
+            task_id=scenario_id,
+            step=step,
+            action=action.action_type.value,
+            reward=round(reward, 4),
+            done=obs_dict.get("done", False),
+            info=obs_dict.get("metadata", {}).get("info", ""),
         )
 
         if obs_dict.get("done", False):
@@ -290,21 +335,25 @@ def run_task(env: TravelOpsEnvironment, scenario_id: str, task_idx: int) -> dict
         obs_dict = obs.model_dump()
         reward = obs_dict.get("reward", 0.0) or 0.0
         total_reward += reward
-        print(
-            f"[STEP] task_id={scenario_id} step=auto_finalize "
-            f"action=finalize_trip reward={reward:.4f} "
-            f"done={obs_dict.get('done', False)} "
-            f"info={obs_dict.get('metadata', {}).get('info', '')}"
+        _log_event(
+            "STEP",
+            task_id=scenario_id,
+            step="auto_finalize",
+            action="finalize_trip",
+            reward=round(reward, 4),
+            done=obs_dict.get("done", False),
+            info=obs_dict.get("metadata", {}).get("info", ""),
         )
 
     final_score = obs_dict.get("metadata", {}).get("final_score", total_reward)
     if final_score is None:
         final_score = total_reward
 
-    print(
-        f"[END] task_id={scenario_id} "
-        f"total_reward={total_reward:.4f} "
-        f"final_score={final_score:.4f}"
+    _log_event(
+        "END",
+        task_id=scenario_id,
+        total_reward=round(total_reward, 4),
+        final_score=round(final_score, 4) if final_score else 0.0,
     )
 
     return {
@@ -315,15 +364,6 @@ def run_task(env: TravelOpsEnvironment, scenario_id: str, task_idx: int) -> dict
 
 
 def main():
-    print("=" * 60)
-    print("  TravelOps OpenEnv — Inference")
-    print("=" * 60)
-    print(f"  API_BASE_URL: {API_BASE_URL}")
-    print(f"  MODEL_NAME:   {MODEL_NAME}")
-    print(f"  LLM available: {LLM_AVAILABLE}")
-    print(f"  Scenarios:    {SCENARIO_IDS}")
-    print("=" * 60)
-
     env = TravelOpsEnvironment()
     results = []
 
@@ -336,15 +376,18 @@ def main():
             traceback.print_exc(file=sys.stderr)
             results.append({"task_id": sid, "total_reward": 0.0, "final_score": 0.0})
 
-    print()
-    print("=" * 60)
-    print("  SUMMARY")
-    print("=" * 60)
-    for r in results:
-        print(f"  {r['task_id']}: score={r['final_score']:.4f}")
     avg = sum(r["final_score"] for r in results) / max(len(results), 1)
-    print(f"  Average score: {avg:.4f}")
-    print("=" * 60)
+    print(
+        json.dumps(
+            {
+                "event": "SUMMARY",
+                "average_score": round(avg, 4),
+                "results": results,
+            },
+            ensure_ascii=True,
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
