@@ -1,0 +1,14 @@
+name: "cloud-sre-ops-env"
+version: "0.1.0"
+description: "A Cloud SRE Ops benchmark where an agent troubleshoots microservice outages."
+author: "Antigravity"
+scenarios:
+  - T1_MEMORY_LEAK
+  - T2_BAD_RELEASE
+  - T3_CASCADING_FAILURE
+
+# Used for deploying to HF Spaces Serverless
+docker:
+  build_dir: "."
+  dockerfile: "server/Dockerfile"
+  port: 8000

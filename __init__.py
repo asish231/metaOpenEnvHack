@@ -17,7 +17,7 @@ from .models import (
 try:
     from .client import TravelOpsEnv
 except ImportError:
-    pass  # client optional at import time
+    pass  
 
 __all__ = [
     "TravelAction",
