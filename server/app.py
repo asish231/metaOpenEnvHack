@@ -15,6 +15,16 @@ app = create_app(
     env_name="travel_ops_env",
 )
 
+@app.get("/")
+def read_root():
+    return {
+        "status": "success",
+        "message": "Welcome to the TravelOps OpenEnv Benchmark space!",
+        "endpoints": {
+            "websocket": "/ws"
+        }
+    }
+
 def main():
     import uvicorn
     uvicorn.run("server.app:app", host="0.0.0.0", port=8000, reload=False)
